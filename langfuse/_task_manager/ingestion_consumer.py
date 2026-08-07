@@ -88,6 +88,10 @@ class IngestionConsumer(threading.Thread):
         self._mask = mask
         self._sampler = Sampler(sample_rate)
         self._media_manager = media_manager
+        # Event carried over from the previous _next() call because appending it
+        # would have pushed that batch over MAX_BATCH_SIZE_BYTES. Stored together
+        # with its measured size so it is not masked/truncated twice.
+        self._pending_event: Optional[tuple] = None
 
     def _next(self):
         """Return the next batch of items to upload."""
@@ -101,49 +105,62 @@ class IngestionConsumer(threading.Thread):
             if elapsed >= self._flush_interval:
                 break
             try:
-                event = self._ingestion_queue.get(
-                    block=True, timeout=self._flush_interval - elapsed
-                )
+                if self._pending_event is not None:
+                    # Carried over from the previous batch — already masked,
+                    # truncated and serialization-checked.
+                    event, item_size = self._pending_event
+                    self._pending_event = None
+                else:
+                    event = self._ingestion_queue.get(
+                        block=True, timeout=self._flush_interval - elapsed
+                    )
 
-                # convert pydantic models to dicts
-                if "body" in event and isinstance(event["body"], pydantic.BaseModel):
-                    event["body"] = event["body"].dict(exclude_none=True)
+                    # convert pydantic models to dicts
+                    if "body" in event and isinstance(event["body"], pydantic.BaseModel):
+                        event["body"] = event["body"].dict(exclude_none=True)
 
-                # sample event
-                if not self._sampler.sample_event(event):
-                    self._ingestion_queue.task_done()
+                    # sample event
+                    if not self._sampler.sample_event(event):
+                        self._ingestion_queue.task_done()
 
-                    continue
+                        continue
 
-                # apply mask
-                self._apply_mask_in_place(event)
+                    # apply mask
+                    self._apply_mask_in_place(event)
 
-                # handle multimodal data
-                self._media_manager.process_media_in_event(event)
+                    # handle multimodal data
+                    self._media_manager.process_media_in_event(event)
 
-                # truncate item if it exceeds size limit
-                item_size = self._truncate_item_in_place(
-                    event=event,
-                    max_size=MAX_EVENT_SIZE_BYTES,
-                    log_message="<truncated due to size exceeding limit>",
-                )
+                    # truncate item if it exceeds size limit
+                    item_size = self._truncate_item_in_place(
+                        event=event,
+                        max_size=MAX_EVENT_SIZE_BYTES,
+                        log_message="<truncated due to size exceeding limit>",
+                    )
 
-                # check for serialization errors
-                try:
-                    json.dumps(event, cls=EventSerializer)
-                except Exception as e:
-                    self._log.error(f"Error serializing item, skipping: {e}")
-                    self._ingestion_queue.task_done()
+                    # check for serialization errors
+                    try:
+                        json.dumps(event, cls=EventSerializer)
+                    except Exception as e:
+                        self._log.error(f"Error serializing item, skipping: {e}")
+                        self._ingestion_queue.task_done()
 
-                    continue
+                        continue
+
+                # Batch byte cap. The old code raised RuntimeError AFTER appending,
+                # which the generic except below swallowed (double-acking the event)
+                # — the cap never actually worked, so oversized batches hit the
+                # ingress 413 and were dropped whole. Carry the event over to the
+                # next batch instead; its task_done() fires when that batch uploads.
+                if events and total_size + item_size >= MAX_BATCH_SIZE_BYTES:
+                    self._log.debug(
+                        "batch size cap reached (size: %d), carrying event over", total_size
+                    )
+                    self._pending_event = (event, item_size)
+                    break
 
                 events.append(event)
-
                 total_size += item_size
-                if total_size >= MAX_BATCH_SIZE_BYTES:
-                    self._log.debug("hit batch size limit (size: %d)", total_size)
-                    raise RuntimeError(f"hit batch size limit (size: {total_size})")
-                    break
 
             except Empty:
                 break
@@ -291,6 +308,18 @@ class IngestionConsumer(threading.Thread):
                     and 400 <= int(e.status) < 500
                     and int(e.status) != 429  # retry if rate-limited
                 ):
+                    # A 4xx is not retried and the WHOLE batch is discarded —
+                    # every span whose CREATE/UPDATE event was in it goes
+                    # missing (nameless orphans in the trace). This used to be
+                    # completely silent; scream about it so lost spans are
+                    # diagnosable from the client log.
+                    self._log.error(
+                        "Langfuse ingestion rejected a batch of %d events with HTTP %s"
+                        " — batch DROPPED, spans will be missing or nameless: %s",
+                        len(batch),
+                        e.status,
+                        str(e)[:500],
+                    )
                     return
 
                 raise e
